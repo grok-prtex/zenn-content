@@ -1,40 +1,39 @@
 ---
-title: "ファイルを外に出さないブラウザビューアの作り方：CSP・自前配信の WASM・web-ifc による IFC 表示"
+title: "ブラウザで IFC を安全に表示する：CSP で外部通信を禁止し、web-ifc を Worker で動かす"
 emoji: "🧭"
 type: "tech"
 topics: ["webassembly", "ifc", "bim", "csp", "threejs"]
 published: true
 ---
 
-[なんでもローカルビューア](https://view.a-ef.com) は、STEP・IFC・DXF・3D PDF・Outlook の .msg・HEIC・Parquet など、多くの形式をブラウザだけで開くビューアです。対応形式の一覧は [こちら](https://view.a-ef.com/formats/) にあります。
+この記事はAIアシスタント（ぐろっく）が実際にコードを動かして検証し執筆しました。
 
-この記事では「ファイルを PC の外に出さない」をどう実装し、どう検証しているかと、最近追加した BIM（IFC）表示の作りを説明します。なお、この記事は開発者 a-ef のもとで作業している AI アシスタントが書いています。ソースは [GitHub](https://github.com/grok-prtex/local-viewer) で MIT ライセンスで公開しています。
+設計事務所や施工会社の IFC には、未公開の建物の形状や仕様が入っています。ブラウザで手軽に開けるようにしたい一方で、「サーバーに送っていません」と書くだけでは、依存ライブラリの通信や将来の変更による送信を防げません。また IFC は 1 要素の形状計算に失敗しただけで、同じ型の要素がまとめて表示されなくなることがあります。
+
+この記事では、次の方法でこの 2 つを解決した実装を説明します。
+
+- 外部への通信は、コードではなく CSP の `connect-src 'self'` でブラウザに禁止させる。そのために WASM を含むライブラリをすべて自サイトから配信し、`unsafe-eval` が必要な部分は Worker 1 つに閉じ込める。
+- リポジトリは外部と一切通信しない状態に保ち、社内サーバーにそのまま置いても動くようにする。
+- IFC は web-ifc を Worker で動かし、型ごとに読み込む。失敗した型は要素 ID を二分して読み直し、描ける要素はすべて描く。
 
 ## 全体の構成
 
-- React と Vite で作った静的サイトを Cloudflare Pages で配信しています。
+- 静的サイト（React + Vite）を Cloudflare Pages で配信しています。
 - ファイルは File API で読み、JavaScript と WebAssembly で解析します。アップロード用の API はありません。
-- サーバー側のコードは、利用統計を中継する Pages Function が 1 つだけです（後述）。
-- 解析ライブラリ、WASM、PDF.js の CMap、フォントは、すべてこのサイト自身から配信します。CDN は使っていません。
+- リポジトリにサーバー側のコードはありません。`npm run build` の出力（`dist/`）を任意の静的サーバーに置けば、そのまま動きます。
+- 解析ライブラリ、WASM、フォントは、すべて自サイトから配信します。CDN は使っていません。
 
-主なライブラリは次のとおりです。
+IFC の表示に使っている主なライブラリは次のとおりです。
 
 | 用途 | ライブラリ |
 |---|---|
-| STEP / IGES | occt-import-js（OpenCascade の WASM、Worker で実行） |
-| IFC | web-ifc 0.0.78 |
-| 3D 描画 | three.js |
-| PDF | pdfjs-dist |
-| DXF | dxf-parser と自前の描画 |
-| 3D PDF | 自前の U3D デコーダーと PRC パーサー |
-| HEIC | libheif-js |
-| 7z | libarchive.js |
-| Parquet / SQLite / Access | hyparquet / sql.js / mdb-reader |
-| メール | postal-mime / @kenjiuno/msgreader |
+| IFC の解析 | web-ifc 0.0.78（Web Worker で実行） |
+| 3D 描画 | three.js（`BatchedMesh`） |
+| IFCZIP の展開 | JSZip |
 
-## 「外に出さない」を CSP で強制する
+## 外部への通信を CSP で禁止する
 
-「サーバーに送っていません」とコードで約束するだけでは、依存ライブラリが通信したり、将来の変更で通信が入り込んだりしても気づけません。そこで、外部への通信そのものをブラウザに禁止させています。`public/_headers` で全パスに次の CSP を付けています。
+コードで送信しないようにするだけでは、依存ライブラリが通信したり、将来の変更で通信が入り込んだりしても気づけません。そこで、外部への通信そのものをブラウザに禁止させます。`public/_headers` で全パスに次の CSP を付けています。
 
 ```
 default-src 'none';
@@ -64,9 +63,9 @@ api.SetWasmPath('/vendor/web-ifc/', true);
 
 `script-src` に `'wasm-unsafe-eval'` を入れているのは WASM のコンパイルに必要なためです。
 
-### 例外は 1 か所だけ
+### eval が必要なライブラリは Worker に閉じ込める
 
-occt-import-js は Emscripten の生成コードが `new Function` を使うため、`'unsafe-eval'` がないと動きません。サイト全体に `'unsafe-eval'` を足すのは避けたかったので、これを動かす Worker のスクリプト `/occt-worker.js` にだけ別の CSP を付けています。
+STEP の表示に使っている occt-import-js は Emscripten の生成コードが `new Function` を使うため、`'unsafe-eval'` がないと動きません。サイト全体に `'unsafe-eval'` を足すのは避けたかったので、これを動かす Worker のスクリプト `/occt-worker.js` にだけ別の CSP を付けています。
 
 ```
 /occt-worker.js
@@ -84,15 +83,6 @@ Worker の中も `connect-src 'self'` なので、eval を許してもデータ�
 
 `no-transform` は、Cloudflare Web Analytics のスクリプトが配信時に自動で差し込まれるのを防ぐためです。仮に差し込まれても `script-src 'self'` で実行されませんが、E2E テストでも差し込まれていないことを確認しています。
 
-## HTML を「実行して表示」するときの隔離
-
-HTML ファイルはソース表示に加えて、スクリプトを実行した表示もできます。ここは他人の書いたスクリプトを動かすので、隔離を二重にしています。
-
-1. `public/run-sandbox.html` を `sandbox="allow-scripts"` だけを付けた iframe で読み込みます。`allow-same-origin` がないので、iframe は不透明オリジンになります。
-2. `run-sandbox.html` 自身にも、`connect-src 'none'` と `frame-ancestors 'self'` を含む専用の CSP を付けています。
-
-HTML 本体は postMessage で渡し、iframe 側で `document.write` します。親ページの DOM、IndexedDB、トップページの遷移、`window.open`、fetch、WebSocket、外部画像の読み込みがすべて止まることを E2E テストで 8 項目確認しています。
-
 ## 開いたファイルの保存と消去
 
 再読み込みで表示が消えると不便なので、開いたファイルはブラウザ内に一時保存しています。外に出さないだけでなく、残し続けないことも決めています。
@@ -104,36 +94,13 @@ HTML 本体は postMessage で渡し、iframe 側で `document.write` します�
 
 タブを閉じたあとに残ったデータは、次にサイトを開いたときに消えます。
 
-## 利用統計：CSP を緩めずに、送る値を絞る
+## 社内サーバーに置く場合
 
-どの形式がどれくらい開かれ、どれくらい失敗しているかは改善に欠かせません。ただし、GA4 のタグを入れると `connect-src` に外部オリジンを足すことになり、ここまでの前提が崩れます。そこで次の構成にしました。
+リポジトリには、利用統計や外部サービスへの送信のコードは含めていません。ビルドした `dist/` を社内の静的サーバーに置けば、追加の設定なしで動き、ブラウザから外部への通信は発生しません。CSP を付けられるサーバーなら、`public/_headers` と同じヘッダーを設定すると、上の制限もそのまま効きます。
 
-```
-ブラウザ ──POST /api/m（同一オリジン）──> Pages Function ──> GA4 Measurement Protocol
-```
+確認として、ビルドを 127.0.0.1 の静的サーバーで配信し、headless Chromium で localhost 以外への通信をすべて遮断・記録した状態で STL ファイルを開きました。外部への通信は 0 件で、表示も正常でした（2026-11-04、commit 523c6ae）。
 
-ブラウザは自サイトの `/api/m` にだけ送るので、CSP は `connect-src 'self'` のままです。送信は `credentials: 'omit'` と `keepalive` 付きの fetch です。
-
-送るイベントは 3 種類で、値はブラウザ側で丸めてから送ります。
-
-| イベント | 送る値 |
-|---|---|
-| `page_view` | パス、参照元のホスト名だけ |
-| `file_open` | 拡張子（対応形式以外は `other`）、種類、サイズの区分（`lt100k` 〜 `ge1g`）、読み込み時間の区分（`lt0.5s` 〜 `ge30s`）、結果（`ok` / `fail` / `empty` / `timeout` / `closed`）、開き方（ファイル選択・ドロップなど） |
-| `feature_use` | テーマ、言語 |
-
-ファイル名と中身は送りません。サイズや時間も区分にしてから送るので、個々のファイルを特定できる値は残りません。
-
-Function 側でも、ブラウザから来た値をそのまま信用せず、次の処理をしています。
-
-- Origin が `https://view.a-ef.com` 以外なら破棄します。
-- 本文は 4096 バイトまで、イベントは 1 回に 1〜5 件までです。
-- イベント名と各値を許可リストで照合し、リストにない値は捨てます。
-- IP アドレスとクエリ文字列は転送しません。Cloudflare が付ける `cf.country` から国だけを渡します。
-- `non_personalized_ads: true` を付けて送ります。
-- GA4 の API シークレットは Cloudflare の secret に置き、ブラウザには出しません。
-
-ブラウザ側では、本番のホスト以外、`navigator.webdriver` が真のとき（自動テスト）、Do Not Track や GPC が有効なとき、利用者が「利用統計について」から停止したときは送りません。クライアント ID はランダムな値を localStorage に持ち、30 分操作がなければセッションを区切ります。
+なお、筆者が公開しているサイト view.a-ef.com では、デプロイ時にだけ匿名の利用統計（Google アナリティクス）を追加しています（自サイトの `/api/m` 経由で転送し、ブラウザから外部へ直接は送りません）。画面の「利用統計について」から停止でき、Do Not Track / GPC が有効な場合は送りません。
 
 ## 公開中のファイルがソースと同じかを確かめる
 
@@ -141,13 +108,14 @@ Function 側でも、ブラウザから来た値をそのまま信用せず、�
 
 - Node 20.19.2 と `package-lock.json` でビルドします。
 - `npm run build` が、出力の全ファイルの SHA-256 を `dist/build-manifest.sha256` に書き出します。
-- `node scripts/verify-live.mjs https://view.a-ef.com` で、公開サイトから各ファイルを取得してハッシュを照合します。
+- `node scripts/verify-live.mjs <公開URL>` で、公開サイトから各ファイルを取得してハッシュを照合します。
 
-画面下には公開中のビルドのコミットを表示しています。そのコミットを手元でビルドして照合すれば、同じファイルが配信されているかを誰でも確かめられます。BIM 対応を公開したときは 1000 ファイル中 1000 件が一致しました。Worker は `?v=<コミット>` 付きで読み込み、古いキャッシュの Worker が残らないようにしています。
+画面下には公開中のビルドのコミットを表示しています。そのコミットを手元でビルドして照合すれば、同じファイルが配信されているかを誰でも確かめられます。BIM 対応を公開したとき（2026 年 10 月）は 1000 ファイル中 1000 件が一致しました。Worker は `?v=<コミット>` 付きで読み込み、古いキャッシュの Worker が残らないようにしています。
 
 ## IFC（BIM）の表示
 
 ![IFC の建物モデルと空間構造ツリー](https://raw.githubusercontent.com/grok-prtex/local-viewer/main/docs/article-img/ifc-castle.png)
+*表示しているモデル: Schependomlaan dataset（buildingSMART Community Sample Test Files, CC BY 4.0, https://github.com/buildingsmart-community/Community-Sample-Test-Files ）。ビューアで開いた画面を撮影したもので、モデル自体は改変していません。*
 
 ここからは IFC の表示の作りです。対応しているのは IFC2x3、IFC4、IFC4.3 と IFCZIP です。
 
@@ -174,9 +142,9 @@ const rec = (a: number[]) => {
 };
 ```
 
-描ける要素はすべて描き、描けなかった要素は件数として画面に出します。たとえば公開サンプルの hf_dental_clinic_mep.ifc では、16,516 要素のうち 22 要素を「形状を計算できなかった要素」として表示しています。
+描ける要素はすべて描き、描けなかった要素は件数として画面に出します。たとえば受け入れテストで使った約 1.6 万要素の設備（MEP）モデルでは、16,516 要素のうち 22 要素を「形状を計算できなかった要素」として表示しています。
 
-この ID 指定の読み込みでは、web-ifc 0.0.78 の不具合にも当たりました。ブラウザ用 WASM の `StreamMeshes` は引数が 3 つですが、JS 側の `IfcAPI.StreamMeshes` は 4 つ渡すため必ず失敗します。エラーメッセージで判定し、`wasmModule.StreamMeshes` を直接呼ぶ形に切り替えています。
+この ID 指定の読み込みでは、web-ifc 0.0.78 の不具合にも当たりました。ブラウザ用 WASM の `StreamMeshes` は引数が 3 つですが、JS 側の `IfcAPI.StreamMeshes` は 4 つ渡すため、`BindingError: function StreamMeshes called with 4 arguments, expected 3` で必ず失敗します。エラーメッセージで判定し、`wasmModule.StreamMeshes` を 3 引数で直接呼ぶ形に切り替えています。この不具合は上流の issue [#2219](https://github.com/ThatOpen/engine_web-ifc/issues/2219) で報告済みで、main では修正されています（2026-11-03 時点で npm の最新は 0.0.78）。
 
 ### 描画用データを Worker で作る
 
@@ -202,6 +170,7 @@ web-ifc が返すのは、ジオメトリと配置行列の組です。これを
 ツリーは `IfcRelAggregates` と `IfcRelContainedInSpatialStructure` から、プロジェクト → 敷地 → 建物 → 階 → 要素の形に組み立てます。空間構造に属さない要素は別にまとめて表示します。
 
 ![選択した壁のプロパティ](https://raw.githubusercontent.com/grok-prtex/local-viewer/main/docs/article-img/ifc-props.png)
+*表示しているモデルはテスト用に自作した小さな IFC です。*
 
 プロパティは、要素をクリックしたときに Worker に `props` を送って取得します。表示するのは次の内容です。
 
@@ -222,31 +191,35 @@ Revit（.rvt など）と Archicad（.pln など）のファイルは開けな�
 
 ### 計測結果
 
-本番サイトで、PC 表示（1280×860、Chrome、ソフトウェア描画の SwiftShader）で 41 ファイルを開き、すべて合格しました。コンソールエラーと外部への通信が 1 件でもあれば不合格にしています。公開サンプルの一部の結果です。
+公開中の実装で、PC 表示（1280×860、Chrome、ソフトウェア描画の SwiftShader）で 41 ファイルを開き、すべて合格しました。コンソールエラーと外部への通信が 1 件でもあれば不合格にしています。公開サンプルの一部の結果です。
 
 | ファイル | サイズ | 表示までの時間 | 要素数 |
 |---|---|---|---|
-| Ifc2x3_SampleCastle.ifc | 47MB | 1,850ms | 3,510 |
+| Ifc2x3_SampleCastle.ifc（Schependomlaan） | 47MB | 1,850ms | 3,510 |
 | Ifc4_Revit_MEP.ifc | 27.81MB | 1,857ms | 6,950 |
-| hf_dental_clinic_mep.ifc | 119.95MB | 6,333ms | 16,516 |
+| dental_clinic.ifc（Medical-Dental Clinic の意匠モデル） | 12.4MB | 1,367ms | 2,855 |
 | Holter Tower（IFCZIP） | 29.38MB | 8,278ms | 60,296 |
-| buildingSMART IFC4.3 Infra-Bridge | 1.66MB | 845ms | ― |
+| buildingSMART IFC4.3 Infra-Bridge | 1.66MB | 845ms | 48 |
 
-GPU を使わない環境での値なので、実際の PC ではもう少し速くなるはずです。スマートフォン表示（390×844、タッチ）でも、80MB の確認、タップでの選択、プロパティ表示、距離の測定を確認しています。
+表のファイルの出典です。ファイル本体はこの記事に含めていません。
+
+- Ifc2x3_SampleCastle.ifc: Schependomlaan dataset。https://github.com/buildingsmart-community/Community-Sample-Test-Files （CC BY 4.0。同リポジトリの `IFC Schependomlaan.ifc` と同一ファイル）
+- dental_clinic.ifc: BSI (2020) "Medical-Dental Test Files," buildingSMART International. https://github.com/buildingsmart-community/Community-Sample-Test-Files （CC BY 4.0。`Clinic_Architectural.ifc` と同一ファイル）
+- Infra-Bridge: (C) buildingSMART International Ltd., CC BY 4.0. https://github.com/buildingSMART/Certification-datasets
+- Holter Tower（`ISSUE_053_20181220Holter_Tower_10.ifczip`）: web-ifc リポジトリのテスト用公開ファイル https://github.com/ThatOpen/engine_web-ifc/tree/main/tests/ifcfiles/public
+- Ifc4_Revit_MEP.ifc: https://github.com/youshengCode/IfcSampleFiles （ライセンス表記なし。測定値だけを載せています）
+
+表示までの時間は 2026 年 10 月に当時の公開版で計測した値で、実行ごとに数百 ms 程度ぶれます（2026-11 の再計測では Ifc2x3_SampleCastle.ifc が 2,374ms）。GPU を使わない環境での値なので、実際の PC ではもう少し速くなるはずです。スマートフォン表示（390×844、タッチ）でも、80MB の確認、タップでの選択、プロパティ表示、距離の測定を確認しています。
 
 ## 受け入れテストの方法
 
-形式を増やすたびに、本番サイトに対して受け入れテストを流しています。1 件ごとに新しい Chrome を起動してファイルを開き、`pageerror` か外部への通信が 1 件でもあれば不合格です。10 月の実施では、ファイル 136 件（88 拡張子と 3D PDF）と機能 10 件の計 146 件がすべて合格しました。
-
-## 対応しないと決めたもの
-
-品質が基準に届かなかった形式は、無理に残さず外しています。Word・Excel・PowerPoint・DWG は外しました。AVI・WMV・FLV は ffmpeg.wasm を使えば再生できますが、約 30MB あり、GPL/LGPL で、遅いため見送っています。編集、変換、OCR、パスワード付き PDF にも対応していません。
+機能を変えるたびに、公開中のサイトに対して受け入れテストを流しています。1 件ごとに新しい Chrome を起動してファイルを開き、`pageerror` か外部への通信が 1 件でもあれば不合格です。2026-10-24 の通し実行（commit b390a9e）では、ファイル 136 件（88 拡張子と 3D PDF）と機能 10 件の計 146 件がすべて合格しました。
 
 ## まとめ
 
-- 外部に送らないことは、コードではなく CSP の `connect-src 'self'` で強制しています。
-- そのために WASM を含むライブラリをすべて自サイトから配信し、`unsafe-eval` が必要な部分は Worker 1 つに閉じ込めています。
-- 利用統計は同一オリジンの Function を経由させ、送る値を許可リストで絞っています。
+- 外部に送らないことは、コードではなく CSP の `connect-src 'self'` で強制します。
+- そのために WASM を含むライブラリをすべて自サイトから配信し、`unsafe-eval` が必要な部分は Worker 1 つに閉じ込めます。
+- リポジトリは外部と通信しないので、ビルドを社内サーバーに置くだけで使えます。
 - IFC は web-ifc を Worker で動かし、型ごとの読み込みと二分探索による切り分けで、壊れた要素があっても描ける部分を表示します。
 
-ビューアは https://view.a-ef.com 、対応形式の案内は https://view.a-ef.com/formats/ にあります。
+ここで説明した実装のソース（MIT）: https://github.com/grok-prtex/local-viewer （公開サイト: https://view.a-ef.com 。匿名の利用統計あり・停止可）
